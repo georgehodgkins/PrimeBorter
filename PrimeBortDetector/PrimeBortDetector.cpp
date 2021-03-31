@@ -1,4 +1,4 @@
-#include "PrimeBortDetector.h"
+#include "llvm/Transforms/PrimeBortDetector/PrimeBortDetector.h"
 #include "llvm/Support/Debug.h"
 #define DEBUG_TYPE "primebort"
 #include <cassert>
@@ -6,17 +6,39 @@
 // maximum number of instructions to search past a tx start for a corresponding commit
 #define INST_SEARCH_LIMIT 8192 
 
+using namespace llvm;
+
+//INITIALIZE_PASS(PrimeBortDetectorPass, "primebort", "Prime+Abort detector", false, false)
+static RegisterPass<PrimeBortDetectorPass> reg ("primebort", "Prime+Abort detector");
 
 namespace llvm {
 
+char PrimeBortDetectorPass::ID = 0;
+
+PrimeBortDetectorPass *createPrimeBortDetectorPass() {return new PrimeBortDetectorPass;}
+
 using CI_list = PrimeBortDetectorPass::CI_list;
 
-PreservedAnalyses PrimeBortDetectorPass::run (Module &M, ModuleAnalysisManager &AM) {
-	
-	// get transaction intrinsics
-	// TODO: support asm
-	Function* txBegin = M.getFunction("llvm.x86.int_x86_xbegin");
-	Function* txCommit = M.getFunction("llvm.x86.int_x86_xend");
+PrimeBortDetectorPass::PrimeBortDetectorPass() : ModulePass(ID) {}
+
+#define COPY(x) x(src.x)
+PrimeBortDetectorPass::PrimeBortDetectorPass(const PrimeBortDetectorPass& src) : 
+		ModulePass(ID),
+		COPY(txCommitCallers), COPY(txCommitCallees), COPY(txCommitCallerLevels),
+		COPY(txBeginCallers), COPY(txBeginCallees), COPY(txBeginCallerLevels),
+		COPY(pairedTxBegin), COPY(pairedTxCommit) {}
+
+PreservedAnalyses PrimeBortDetectorPass::run(Module &M, ModuleAnalysisManager &AM) {
+	runOnModule(M);
+	return PreservedAnalyses::all();
+}
+
+
+bool PrimeBortDetectorPass::runOnModule(Module &M) {
+	LLVM_DEBUG(dbgs() << "Start Prime+Abort detector pass";);
+
+	Function* txBegin = M.getFunction("llvm.x86.xbegin");
+	Function* txCommit = M.getFunction("llvm.x86.xend");
 
 	if (txBegin) {
 		assert(txCommit);
@@ -30,6 +52,7 @@ PreservedAnalyses PrimeBortDetectorPass::run (Module &M, ModuleAnalysisManager &
 		// check graph one level at a time
 		// TODO: this code assumes the ancestor will be at the same level
 		// for both, which is likely but not certain
+		bool endSearch = false;
 		do {
 			// get next graph level
 			CI_list new_blevel = levelUpCallerGraph(txBegin, txBeginCallers,
@@ -37,8 +60,8 @@ PreservedAnalyses PrimeBortDetectorPass::run (Module &M, ModuleAnalysisManager &
 			CI_list new_clevel = levelUpCallerGraph(txCommit, txCommitCallers,
 								txCommitCallees, txCommitCallerLevels);
 
-			// find nodes on both lists and remove them from the original list
-			CI_list candidates = diffCallerGraphs(txBeginCallers, txCommitCallers);
+			// find the intersection of the lists and move those nodes to a new list
+			CI_list candidates = diffCallerGraphs(new_blevel, new_clevel);
 
 			// get call chains to txBegin and txCommit for each common ancestor found
 			SmallVector<CallInst*, 4> strand;
@@ -61,13 +84,14 @@ PreservedAnalyses PrimeBortDetectorPass::run (Module &M, ModuleAnalysisManager &
 				pairedTxCommit.push_back(std::move(strand));
 			}
 
+			// end when no non-common ancestors were (will be) added to the graph
+			endSearch = new_blevel.empty() && new_clevel.empty();
+
 			// put remainder of graph level (non-common ancestors)
 			// on the graph for the next round of searching
 			txCommitCallers.splice(txCommitCallers.end(), new_clevel);
 			txBeginCallers.splice(txBeginCallers.end(), new_blevel);
-		// end when no non-common ancestors were added to the graph on this pass
-		} while (txCommitCallers.end() != txCommitCallerLevels.back() &&
-				 txBeginCallers.end() != txBeginCallerLevels.back());
+		} while (!endSearch);
 
 		assert(txCommitCallers.end() == txCommitCallerLevels.back() &&
 				txBeginCallers.end() == txBeginCallerLevels.back());
@@ -87,7 +111,8 @@ PreservedAnalyses PrimeBortDetectorPass::run (Module &M, ModuleAnalysisManager &
 		);
 	}
 
-	return PreservedAnalyses::all();
+	// does not modify code
+	return false;
 }
 
 bool PrimeBortDetectorPass::compCallInstByFunction(const CallInst* A, const CallInst* B) {

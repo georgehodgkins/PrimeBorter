@@ -8,12 +8,17 @@
 #include <list>
 
 namespace llvm {
-	
-class PrimeBortDetectorPass : public PassInfoMixin<PrimeBortDetectorPass> {
+
+class PrimeBortDetectorPass : public ModulePass {
 
 	public:
 	typedef std::list<CallInst*> CI_list;
+	bool runOnModule (Module &M);
 	PreservedAnalyses run (Module &M, ModuleAnalysisManager &AM);
+	PrimeBortDetectorPass();
+	PrimeBortDetectorPass(const PrimeBortDetectorPass&);
+	static char ID;
+	static StringRef name() {return "primebort";}
 	
 	private:
 
@@ -37,4 +42,5 @@ class PrimeBortDetectorPass : public PassInfoMixin<PrimeBortDetectorPass> {
 			SmallVectorImpl<CI_list::iterator>&);
 };
 
+PrimeBortDetectorPass* createPrimeBortDetectorPass();
 }
