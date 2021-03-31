@@ -24,6 +24,14 @@ void commitTx () {
 
 unsigned chomp;
 int main () {
+
+	if (_xbegin() == UINT_MAX) {
+		chomp = 2;
+	} else {
+		chomp = 11;
+	}
+	_xend();
+
 	if (beginTx()) {
 		++chomp;
 	} else {

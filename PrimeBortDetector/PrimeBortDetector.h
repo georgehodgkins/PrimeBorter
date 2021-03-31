@@ -36,10 +36,9 @@ class PrimeBortDetectorPass : public ModulePass {
 	// comparator to order CallInsts by their parent function
 	static bool compCallInstByFunction(const CallInst*, const CallInst*);
 	// returns the intersection of two graphs, removing those elements from the operands
-	CI_list diffCallerGraphs(CI_list&, CI_list&);
+	std::pair<CI_list, CI_list> diffCallerGraphs(CI_list&, CI_list&);
 	// computes and returns the next level of a caller graph
-	CI_list levelUpCallerGraph(Function*, CI_list&, DenseMap<CallInst*, CallInst*>&, 
-			SmallVectorImpl<CI_list::iterator>&);
+	CI_list levelUpCallerGraph(Function*, CI_list&, DenseMap<CallInst*, CallInst*>&);
 };
 
 PrimeBortDetectorPass* createPrimeBortDetectorPass();

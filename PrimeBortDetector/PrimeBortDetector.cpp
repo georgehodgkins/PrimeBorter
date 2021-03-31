@@ -50,23 +50,24 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 		 */
 
 		// check graph one level at a time
-		// TODO: this code assumes the ancestor will be at the same level
-		// for both, which is likely but not certain
-		bool endSearch = false;
+		// TODO: this code assumes a common ancestor will be at the same level
+		// for both, which is likely, but not certain
+		CI_list prev_blevel, prev_clevel, new_blevel, new_clevel;
 		do {
 			// get next graph level
-			CI_list new_blevel = levelUpCallerGraph(txBegin, txBeginCallers,
-									txBeginCallees, txBeginCallerLevels);
-			CI_list new_clevel = levelUpCallerGraph(txCommit, txCommitCallers,
-								txCommitCallees, txCommitCallerLevels);
+			new_blevel = levelUpCallerGraph(txBegin, prev_blevel,
+									txBeginCallees);
+			new_clevel = levelUpCallerGraph(txCommit, prev_clevel,
+								txCommitCallees);
 
 			// find the intersection of the lists and move those nodes to a new list
-			CI_list candidates = diffCallerGraphs(new_blevel, new_clevel);
+			auto candidates = diffCallerGraphs(new_blevel, new_clevel);
 
 			// get call chains to txBegin and txCommit for each common ancestor found
 			SmallVector<CallInst*, 4> strand;
-			for (auto C = candidates.begin(); C != candidates.end(); ++C) {
-				CallInst* CI = *C;
+			auto C = candidates.second.begin();
+			for (auto B = candidates.first.begin(); B != candidates.first.end(); ++B) {
+				CallInst* CI = *B;
 				do {
 					strand.push_back(CI);
 					auto f_it = txBeginCallees.find(CI);
@@ -74,6 +75,7 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 					CI = f_it->second;
 				} while (CI);
 				pairedTxBegin.push_back(std::move(strand));
+				assert(C != candidates.second.end());
 				CI = *C;
 				do {
 					strand.push_back(CI);
@@ -82,19 +84,16 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 					CI = f_it->second;
 				} while (CI);
 				pairedTxCommit.push_back(std::move(strand));
+				++C;
 			}
 
-			// end when no non-common ancestors were (will be) added to the graph
-			endSearch = new_blevel.empty() && new_clevel.empty();
+			// remainder is non-common ancestors
+			prev_blevel = new_blevel;
+			prev_clevel = new_clevel;
+		// end when no non-common ancestors were found on this iteration
+		} while (!prev_blevel.empty() && !prev_clevel.empty());
 
-			// put remainder of graph level (non-common ancestors)
-			// on the graph for the next round of searching
-			txCommitCallers.splice(txCommitCallers.end(), new_clevel);
-			txBeginCallers.splice(txBeginCallers.end(), new_blevel);
-		} while (!endSearch);
-
-		assert(txCommitCallers.end() == txCommitCallerLevels.back() &&
-				txBeginCallers.end() == txBeginCallerLevels.back());
+		assert(prev_blevel.empty() && prev_clevel.empty());
 		assert(pairedTxBegin.size() == pairedTxCommit.size());
 
 		LLVM_DEBUG(
@@ -119,10 +118,11 @@ bool PrimeBortDetectorPass::compCallInstByFunction(const CallInst* A, const Call
 	return A->getFunction() < B->getFunction();
 }
 
-CI_list PrimeBortDetectorPass::diffCallerGraphs(CI_list& A, CI_list& B) {
+std::pair<CI_list, CI_list>
+PrimeBortDetectorPass::diffCallerGraphs(CI_list& A, CI_list& B) {
 	auto A_it = A.begin();
 	auto B_it = B.begin();
-	CI_list intersection;
+	std::pair<CI_list, CI_list> intersect;
 
 	while (A_it != A.end() && B_it != B.end()) {
 		if (compCallInstByFunction(*A_it, *B_it)) { // A < B
@@ -134,22 +134,21 @@ CI_list PrimeBortDetectorPass::diffCallerGraphs(CI_list& A, CI_list& B) {
 			auto B_old = B_it;
 			++A_it;
 			++B_it;
-			intersection.splice(intersection.end(), A, A_old);
-			B.erase(B_old);
+			intersect.first.splice(intersect.first.end(), A, A_old);
+			intersect.second.splice(intersect.second.end(), B, B_old);
 		}
 	}
 
-	return intersection;
+	assert(intersect.first.size() == intersect.second.size());
+	return intersect;
 }
 
-CI_list PrimeBortDetectorPass::levelUpCallerGraph(Function* root, CI_list& graph,
-		DenseMap<CallInst*, CallInst*>& links, SmallVectorImpl<CI_list::iterator>& levels) {
+CI_list PrimeBortDetectorPass::levelUpCallerGraph(Function* root, CI_list& prev_level,
+		DenseMap<CallInst*, CallInst*>& links) {
 
 	CI_list new_level;
-	if (graph.empty()) {
+	if (prev_level.empty()) {
 		assert(links.empty());
-		assert(levels.empty());
-		levels.push_back(graph.end());
 		for (auto U = root->user_begin(); U != root->user_end(); ++U) {
 			if (isa<CallInst>(*U)) {
 				CallInst* CI = cast<CallInst>(*U);
@@ -159,10 +158,7 @@ CI_list PrimeBortDetectorPass::levelUpCallerGraph(Function* root, CI_list& graph
 			}
 		}
 	} else {
-		CI_list::iterator lb = levels.back();
-		assert(lb != graph.end());
-		levels.push_back(graph.end());
-		for (auto I = lb; I != levels.back(); ++I) {
+		for (auto I = prev_level.begin(); I != prev_level.end(); ++I) {
 			Function* F = (*I)->getFunction();
 			for (auto U = F->user_begin(); U != F->user_end(); ++U) {
 				if (isa<CallInst>(*U)) {
