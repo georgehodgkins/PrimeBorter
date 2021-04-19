@@ -1,0 +1,11 @@
+LLVM pass:
+	- Verify path measurement
+	- Multiple roots
+	- Path length caching
+	- Input analysis
+
+Evaluation framework:
+	- Test code for Pin
+	- Write attacks
+	- Find benign code
+
