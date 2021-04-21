@@ -17,6 +17,8 @@ class PrimeBortDetectorPass : public ModulePass {
 
 	public:
 	typedef std::list<CallInst*> CI_list;
+	typedef DenseMap<Function*,
+			std::pair<SmallVector<CallInst*, 4>, SmallVector<CallInst*, 4> > > CandidateMap;
 	bool runOnModule (Module &M);
 	PreservedAnalyses run (Module &M, ModuleAnalysisManager &AM);
 	PrimeBortDetectorPass();
@@ -24,39 +26,47 @@ class PrimeBortDetectorPass : public ModulePass {
 	static char ID;
 	static StringRef name() {return "primebort";}
 	
-	void getAnalysisUsage(AnalysisUsage &AU) {
+	void getAnalysisUsage(AnalysisUsage &AU) const override {
 		AU.addRequired<ScalarEvolutionWrapperPass>();
 		AU.addRequired<LoopInfoWrapperPass>();
+		AU.setPreservesAll();
 	}
+
+	struct TxInfo {
+		CallInst* entry;
+		Function* ancestor;
+		SmallVector<CallInst*, 4> exits;
+		SmallVector<CallInst*, 4> entryChain;
+		SmallVector<SmallVector<CallInst*, 4>, 4> exitChains;
+		SmallVector<size_t, 4> txLat;
+		SmallVector<size_t, 4> rtLat;
+	};
 
 	private:
 	DenseMap<BasicBlock*, size_t> BBLatCache;
 
 	CI_list txCommitCallers;
 	DenseMap<CallInst*, CallInst*> txCommitCallees;
-	SmallVector<CI_list::iterator, 4> txCommitCallerLevels;
 
 	CI_list txBeginCallers;
 	DenseMap<CallInst*, CallInst*> txBeginCallees;
-	SmallVector<CI_list::iterator, 4> txBeginCallerLevels;
 
-	// TODO: organize in a struct
-	SmallVector<SmallVector<CallInst*, 4>, 0> pairedTxBegin;
-	SmallVector<SmallVector<CallInst*, 4>, 0> pairedTxCommit;
-	
-	SmallVector<size_t, 4> txLat;
-	SmallVector<size_t, 4> rtnLat;
+	DenseMap<CallInst*, TxInfo> foundTx;
 
 	// comparator to order CallInsts by their parent function
 	static bool compCallInstByFunction(const CallInst*, const CallInst*);
 	// returns the intersection of two graphs, removing those elements from the operands
-	std::pair<CI_list, CI_list> diffCallerGraphs(CI_list&, CI_list&);
+	CandidateMap findCandidates (CI_list&, CI_list&);
 	// computes and returns the next level of a caller graph
 	CI_list levelUpCallerGraph(Function*, CI_list&, DenseMap<CallInst*, CallInst*>&);
+	// match tx entry points with reachable exit points in the same function
+	void boundTxInFunc(BasicBlock*, const SmallVectorImpl<CallInst*>&, TxInfo&);
 	// estimates total latency for a loop
 	size_t estimateTotalLoopLat(const Loop*, BasicBlock*&, const bool);
-	// estimate longest/shortest path between two instructions
-	size_t estimateLongestPath(Instruction*, const Instruction*);
+	// estimate longest/shortest path between two instructions given call chains
+	// up to their common ancestor
+	size_t estimateLongestPath(const SmallVectorImpl<CallInst*>&,
+			const SmallVectorImpl<CallInst*>&);
 	size_t estimateShortestPath(Instruction*, const Instruction*);
 	// implementation for the above fns
 	size_t estimatePathLat(BasicBlock*, const Instruction*, const size_t, const bool,

@@ -19,15 +19,16 @@ char PrimeBortDetectorPass::ID = 0;
 PrimeBortDetectorPass *createPrimeBortDetectorPass() {return new PrimeBortDetectorPass;}
 
 using CI_list = PrimeBortDetectorPass::CI_list;
+using CandidateMap = PrimeBortDetectorPass::CandidateMap;
+using TxInfo = PrimeBortDetectorPass::TxInfo;
 
 PrimeBortDetectorPass::PrimeBortDetectorPass() : ModulePass(ID) {}
 
 #define COPY(x) x(src.x)
 PrimeBortDetectorPass::PrimeBortDetectorPass(const PrimeBortDetectorPass& src) : 
 		ModulePass(ID),
-		COPY(txCommitCallers), COPY(txCommitCallees), COPY(txCommitCallerLevels),
-		COPY(txBeginCallers), COPY(txBeginCallees), COPY(txBeginCallerLevels),
-		COPY(pairedTxBegin), COPY(pairedTxCommit) {}
+		COPY(txCommitCallers), COPY(txCommitCallees),
+		COPY(txBeginCallers), COPY(txBeginCallees), COPY(foundTx) {}
 
 PreservedAnalyses PrimeBortDetectorPass::run(Module &M, ModuleAnalysisManager &AM) {
 	runOnModule(M);
@@ -51,8 +52,6 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 		 */
 
 		// check graph one level at a time
-		// TODO: this code assumes a common ancestor will be at the same level
-		// for both, which is likely, but not certain
 		CI_list prev_blevel, prev_clevel, new_blevel, new_clevel;
 		do {
 			// get next graph level
@@ -61,31 +60,24 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 			new_clevel = levelUpCallerGraph(txCommit, prev_clevel,
 								txCommitCallees);
 
-			// find the intersection of the lists and move those nodes to a new list
-			auto candidates = diffCallerGraphs(new_blevel, new_clevel);
+			// find tx entries and exits in the same function
+			auto candidates = findCandidates(new_blevel, new_clevel);
 
-			// get call chains to txBegin and txCommit for each common ancestor found
-			SmallVector<CallInst*, 4> strand;
-			auto C = candidates.second.begin();
-			for (auto B = candidates.first.begin(); B != candidates.first.end(); ++B) {
-				CallInst* CI = *B;
-				do {
-					strand.push_back(CI);
-					auto f_it = txBeginCallees.find(CI);
-					assert(f_it != txBeginCallees.end());
-					CI = f_it->second;
-				} while (CI);
-				pairedTxBegin.push_back(std::move(strand));
-				assert(C != candidates.second.end());
-				CI = *C;
-				do {
-					strand.push_back(CI);
-					auto f_it = txCommitCallees.find(CI);
-					assert(f_it != txCommitCallees.end());
-					CI = f_it->second;
-				} while (CI);
-				pairedTxCommit.push_back(std::move(strand));
-				++C;
+			// match entries to exits
+			for (auto it = candidates.begin(); it != candidates.end(); ++it) {
+				auto F = it->second;
+				const SmallVectorImpl<CallInst*>& entries = F.first;
+				const SmallVectorImpl<CallInst*>& exits = F.second;
+				// each entry is its own transaction, with one or more exits
+				for (CallInst* entry : entries) {
+					TxInfo info;
+					info.entry = entry;
+					info.ancestor = it->first;
+					// find any of these exits that are reachable and record them in info
+					boundTxInFunc(entry->getParent(), exits, info);
+					assert(!info.exits.empty() && "PrimeBort: No reachable tx exits found!");
+					foundTx[entry] = info;
+				}
 			}
 
 			// remainder is non-common ancestors
@@ -95,35 +87,59 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 		} while (!prev_blevel.empty() && !prev_clevel.empty());
 
 		assert(prev_blevel.empty() && prev_clevel.empty());
-		assert(pairedTxBegin.size() == pairedTxCommit.size());
+	
+		// get call chains to entry and exit for each found tx
+		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
+			TxInfo& info = it->second;
+			CallInst* CI = info.entry;
+			do {
+				info.entryChain.push_back(CI);
+				CI = txBeginCallees[CI];
+			} while (CI);
+			for (unsigned i = 0; i < info.exits.size(); ++i) {
+				CI = info.exits[i];
+				info.exitChains.emplace_back();
+				assert(info.exitChains.size() == i+1);
+				do {
+					info.exitChains[i].push_back(CI);
+					CI = txCommitCallees[CI];
+				} while (CI);
+			}
+		}
 
 		/*
 		 * For each paired tx, estimate the longest path through the tx and
 		 * the shortest path back to the beginning from the exit.
 		 */
 
-		for (unsigned i = 0; i < pairedTxBegin.size(); ++i) {
-			size_t tx = estimateLongestPath(pairedTxBegin[i].back(),
-					pairedTxCommit[i].back());
-			size_t rtn = estimateShortestPath(pairedTxCommit[i].back(),
-					pairedTxBegin[i].back());
-			txLat.push_back(tx);
-			rtnLat.push_back(rtn);
+		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
+			TxInfo& info = it->second;
+			for (unsigned i = 0; i < info.exits.size(); ++i) {
+				size_t txLat = estimateLongestPath(info.entryChain, info.exitChains[i]);
+				size_t rtLat = estimateShortestPath(info.exitChains[i].back(),
+					info.entryChain.back());
+				info.txLat.push_back(txLat);
+				info.rtLat.push_back(rtLat);
+				assert(info.txLat.size() == info.rtLat.size() && info.txLat.size() == i+1);
+			}
 		}
 
-		LLVM_DEBUG(
-			dbgs() << "Found " << pairedTxBegin.size() << " tx:\n\n";
-			for (unsigned i = 0; i < pairedTxBegin.size(); ++i) {
-				dbgs() << "txBegin call chain:\n";
-				for (auto it = pairedTxBegin[i].begin(); it != pairedTxBegin[i].end(); ++it)
-					dbgs() << **it << " @ " << (*it)->getFunction() << '\n';
-				dbgs() << "\txCommit call chain:\n";
-				for (auto it = pairedTxCommit[i].begin(); it != pairedTxCommit[i].end(); ++it)
-					dbgs() << **it << " @ " << (*it)->getFunction() << '\n';
-				dbgs() << "Estimated longest tx lat: " << txLat[i] << '\n';
-				dbgs() << "Estimated shortest rtn lat: " << rtnLat[i] << "\n\n";
+LLVM_DEBUG(
+		dbgs() << "FOUND " << foundTx.size() << " TRANSACTIONS:\n=====\n";
+		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
+			TxInfo& info = it->second;
+			dbgs() << "Common Func: " << info.ancestor->getName() <<
+				"\nEntry point: " << *info.entry << " -->" << *(info.entryChain.back()) <<
+				"\nExit\t\t\t\t\t\ttxLat\trtLat\n";
+
+			for (unsigned i = 0; i < info.exits.size(); ++i) { 
+				dbgs() << *info.exits[i] << " -->" << *(info.exitChains[i].back()) 
+				<< "\t" << info.txLat[i] << '\t' << info.rtLat[i] << '\n';
 			}
-		);
+
+			dbgs() << "=====\n";
+		}
+);
 	}
 
 	// does not modify code
@@ -134,11 +150,14 @@ bool PrimeBortDetectorPass::compCallInstByFunction(const CallInst* A, const Call
 	return A->getFunction() < B->getFunction();
 }
 
-std::pair<CI_list, CI_list>
-PrimeBortDetectorPass::diffCallerGraphs(CI_list& A, CI_list& B) {
+
+CandidateMap PrimeBortDetectorPass::findCandidates(CI_list& A, CI_list& B) {
 	auto A_it = A.begin();
 	auto B_it = B.begin();
-	std::pair<CI_list, CI_list> intersect;
+	CandidateMap intersect;
+	// values to be removed at the end
+	SmallVector<CI_list::iterator, 8> rmA;
+	SmallVector<CI_list::iterator, 8> rmB;
 
 	while (A_it != A.end() && B_it != B.end()) {
 		if (compCallInstByFunction(*A_it, *B_it)) { // A < B
@@ -146,16 +165,29 @@ PrimeBortDetectorPass::diffCallerGraphs(CI_list& A, CI_list& B) {
 		} else if (compCallInstByFunction(*B_it, *A_it)) { // B < A
 			++B_it;
 		} else { // equal
-			auto A_old = A_it;
-			auto B_old = B_it;
-			++A_it;
-			++B_it;
-			intersect.first.splice(intersect.first.end(), A, A_old);
-			intersect.second.splice(intersect.second.end(), B, B_old);
+			// there may be multiple in either A or B that match the function,
+			// we want all of them
+			Function* F = (*A_it)->getFunction();
+			intersect[F].first.push_back(*A_it);
+			rmA.push_back(A_it);
+			while ( ++A_it != A.end() && (*A_it)->getFunction() == F) {
+				intersect[F].first.push_back(*A_it);
+				rmA.push_back(A_it);
+			}
+
+			intersect[F].second.push_back(*B_it);
+			rmB.push_back(B_it);
+			while (++B_it != B.end() && (*B_it)->getFunction() == F) {
+				intersect[F].second.push_back(*B_it);
+				rmB.push_back(B_it);
+			}
 		}
 	}
 
-	assert(intersect.first.size() == intersect.second.size());
+	// remove intersection from sets
+	while (!rmA.empty()) {A.erase(rmA.pop_back_val());}
+	while (!rmB.empty()) {B.erase(rmB.pop_back_val());}
+
 	return intersect;
 }
 
@@ -191,6 +223,44 @@ CI_list PrimeBortDetectorPass::levelUpCallerGraph(Function* root, CI_list& prev_
 	return new_level;
 }
 
+void PrimeBortDetectorPass::boundTxInFunc(BasicBlock* current,
+			const SmallVectorImpl<CallInst*>& exits, TxInfo& info) {
+	// clear marked BBs for each new entry point
+	static TxInfo* infoaddr_last = &info;
+	static DenseMap<BasicBlock*, bool> visited;
+	if (&info != infoaddr_last) {
+		visited.clear();
+		infoaddr_last = &info;
+	}
+	// mark BBs to avoid multiple visits
+	if (visited[current] == true) return;
+	else visited[current] = true;
+	
+	// if we have reached an exit add it to exit list and return
+	for (CallInst* exit : exits) {
+		assert(exit->getFunction() == current->getParent());
+		if (current == exit->getParent()) {
+			info.exits.push_back(exit);
+			return;
+		}
+	}
+	const Instruction* T = current->getTerminator();
+	// if we hit a return without an exit just return
+	if (isa<ReturnInst>(T)) {
+LLVM_DEBUG(
+		dbgs() << "PrimeBort: Hit return without tx commit in common caller: "
+		<< current->getParent() << " @ " << current << "\n";
+);
+		return;
+	}
+	// otherwise, recurse on successors
+	for (unsigned i = 0; i < T->getNumSuccessors(); ++i) 
+		boundTxInFunc(T->getSuccessor(i), exits, info);
+
+	return;
+}
+
+
 // setting this high is actually a decent heuristic, because
 // non-canonical loops are pretty suspicious in a tx
 #define FALLBACK_ITER_COUNT 128
@@ -199,7 +269,8 @@ size_t PrimeBortDetectorPass::estimateTotalLoopLat (const Loop* L, BasicBlock*& 
 	// get exit BBs and loop analysis results
 	SmallVector<BasicBlock*, 4> exits;
 	L->getExitBlocks(exits);
-	ScalarEvolution& SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+	ScalarEvolution& SE = 
+		getAnalysis<ScalarEvolutionWrapperPass>(*(entry->getParent())).getSE();
 
 	// find the highest/lowest total latency considering iterations and path length
 	if (SE.isBackedgeTakenCountMaxOrZero(L)) { // no good iteration estimate
@@ -243,9 +314,27 @@ size_t PrimeBortDetectorPass::estimateTotalLoopLat (const Loop* L, BasicBlock*& 
 	}
 }
 
-size_t PrimeBortDetectorPass::estimateLongestPath(Instruction* start, 
-		const Instruction* dest) {
-	return estimatePathLat(start->getParent(), dest, 0, true, true);
+size_t PrimeBortDetectorPass::estimateLongestPath(
+		const SmallVectorImpl<CallInst*>& startChain,
+		const SmallVectorImpl<CallInst*>& destChain) {
+	size_t lat = 0;
+	assert(startChain.front()->getFunction() == destChain.front()->getFunction());
+	
+	// get latency in each function in start chain
+	for (unsigned i = startChain.size()-1; i > 0; --i)
+		lat += estimatePathLat(startChain[i]->getParent(), NULL, lat, true, true);
+
+	// get latency between calls in common ancestor
+	lat += estimatePathLat(startChain.front()->getParent(), destChain.front(),
+			lat, true, true);
+
+	// get latency from each function in dest chain
+	for (unsigned i = 1; i < destChain.size(); ++i) {
+		lat += estimatePathLat(&(destChain[i-1]->getCalledFunction()->getEntryBlock()),
+				destChain[i], lat, true, true);
+	}
+
+	return lat;
 }
 
 size_t PrimeBortDetectorPass::estimateShortestPath(Instruction* start,
@@ -261,11 +350,11 @@ size_t PrimeBortDetectorPass::estimatePathLat (BasicBlock* BB, const Instruction
 	if (prev_lat >= MAX_SEARCH_DIST) return prev_lat;
 
 	LatencyVisitor LV;
-	LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+	LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>(*(BB->getParent())).getLoopInfo();
 	Loop* L = LI.getLoopFor(BB);
 
 	size_t here_lat = 0;
-	if (dest->getParent() == BB) { // we have reached our destination
+	if (dest && dest->getParent() == BB) { // we have reached our destination
 		for (auto it = BB->begin(); &*it != dest; ++it) {
 			LV.visit(*it);
 		}
@@ -275,19 +364,22 @@ size_t PrimeBortDetectorPass::estimatePathLat (BasicBlock* BB, const Instruction
 		here_lat = estimateTotalLoopLat(L, BB, longest);
 	} else {
 		LV.visit(BB);
+		here_lat = LV.getLat();
 		// add latency for called functions
 		while (LV.hasCall()) {
 			CallBase* CB = LV.popCall();
 			Function* F = CB->getCalledFunction();
-			// TODO: ignores indirect calls
-			here_lat += estimatePathLat(&F->getEntryBlock(), CB->getNextNonDebugInstruction(),
-					here_lat, longest, true);
+			if (F && !(F->empty())) { // ignore intrinsics
+				// TODO: ignores indirect calls
+				here_lat += estimatePathLat(&F->getEntryBlock(),
+						NULL, here_lat, longest, true);
+			}
 		}
 	}
 
 	// recurse on each successor, and select the longest/shortest path 
 	size_t more_lat = (longest) ? 0 : SIZE_MAX;
-	if (!LV.sawRet()) { // stop following if function returned
+	if (!isa<ReturnInst>(BB->getTerminator())) { // stop following if block returns
 		Instruction* T = BB->getTerminator(); 
 		for (unsigned i = 0; i < T->getNumSuccessors(); ++i) {
 			size_t succ_lat = estimatePathLat(T->getSuccessor(i), dest, here_lat, longest,

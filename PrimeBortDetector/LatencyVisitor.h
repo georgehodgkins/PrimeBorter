@@ -103,10 +103,6 @@ class LatencyVisitor : public InstVisitor<LatencyVisitor> {
 		}
 	}
 
-
-
-
-
 	void visitBranchInst (BranchInst& I) {lat += (I.isConditional()) ? 2 : 1;} // JMP(xx) i
 	void visitCallBase (CallBase& I) {
 		if (!I.isInlineAsm()) {
@@ -141,12 +137,25 @@ class LatencyVisitor : public InstVisitor<LatencyVisitor> {
 	void visitReturnInst(ReturnInst& I) {lat += 2; saw_ret = true;} // RET or RET i
 	void visitSelectInst(SelectInst& I) {lat += 1;} // ternary operator: CMP + CMOV (.5 + .5)
 	// TODO: visitShuffleVectorInst
-	void visitUnaryInstruction(UnaryInstruction& I) {
+	void visitUnaryOperator(UnaryOperator& I) {
 		// The only implemented unary op seems to be FP negation
 		assert(I.getOpcode() == Instruction::FNeg);
 		lat += 1; // FCHS
 	}
-	// TODO: visitUnreachableInst -- sounds impossible, right?
+	void visitCastInst(CastInst& I) {} // TODO: assumes all casts are reinterps
+	void visitUnreachableInst (UnreachableInst& I) {} // probably fine
+	void visitAllocaInst(AllocaInst& I) { // stack variable alloc: PUSH m
+		static DataLayout DL = DataLayout(I.getModule());
+		if (I.isArrayAllocation()) {
+			auto V = I.getArraySize();
+			if ( ConstantInt* C = dyn_cast<ConstantInt>(V) ) {
+				lat += (size_t) C->getLimitedValue();
+			} else {
+				errs() << "LatencyVisitor: Non-fixed size AllocaInst!";
+				lat += 1;
+			}
+		} else lat += 1;
+	}
 	
 	// fall-through (default block in switch-case, basically)
 	void visitInstruction(Instruction& I) {
