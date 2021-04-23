@@ -1,8 +1,9 @@
 LLVM pass:
-	- Verify path measurement
+	- Remnant cleanup
+	- Loop exits
 	- Multiple roots
 	- Path length caching
-	- Input analysis
+	- Live-in analysis
 
 Evaluation framework:
 	- Test code for Pin
