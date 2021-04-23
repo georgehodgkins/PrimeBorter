@@ -18,12 +18,10 @@ namespace llvm {
 class LatencyVisitor : public InstVisitor<LatencyVisitor> {
 	private:
 	SmallVector<CallBase*, 4> calls;
-	bool saw_ret;
 	size_t lat;
 
 	public:
-	LatencyVisitor() : calls(), saw_ret(false), lat(0) {}
-	bool sawRet () const {return saw_ret;}
+	LatencyVisitor() : calls(), lat(0) {}
 	bool hasCall () const {return !calls.empty();}
 	CallBase* popCall () {return calls.pop_back_val();}
 	size_t getLat() const {return lat;}
@@ -134,7 +132,7 @@ class LatencyVisitor : public InstVisitor<LatencyVisitor> {
 	void visitLandingPadInst(LandingPadInst& I) {} // ENDBR for a exception, no real op
 	void visitPHINode(PHINode& I) {} // no real op
 	void visitResumeInst(ResumeInst& I) {} // more exception stuff.
-	void visitReturnInst(ReturnInst& I) {lat += 2; saw_ret = true;} // RET or RET i
+	void visitReturnInst(ReturnInst& I) {lat += 2;} // RET or RET i
 	void visitSelectInst(SelectInst& I) {lat += 1;} // ternary operator: CMP + CMOV (.5 + .5)
 	// TODO: visitShuffleVectorInst
 	void visitUnaryOperator(UnaryOperator& I) {

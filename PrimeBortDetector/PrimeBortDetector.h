@@ -8,6 +8,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include <list>
+#include <utility>
 
 #define MAX_SEARCH_DIST 1500000 // 1 ms at 1.5 GHz
 
@@ -63,14 +64,21 @@ class PrimeBortDetectorPass : public ModulePass {
 	void boundTxInFunc(BasicBlock*, const SmallVectorImpl<CallInst*>&, TxInfo&);
 	// estimates total latency for a loop
 	size_t estimateTotalLoopLat(const Loop*, BasicBlock*&, const bool);
+	// estimator that can climb up the call graph
+	size_t estimateLatThroughCallers(Instruction*, const CallInst*,
+			const size_t, const bool);
 	// estimate longest/shortest path between two instructions given call chains
 	// up to their common ancestor
+	size_t estimatePathFromChains(const SmallVectorImpl<CallInst*>&,
+			const SmallVectorImpl<CallInst*>&, const bool);
+	// wrappers for estimatePathFromChains
 	size_t estimateLongestPath(const SmallVectorImpl<CallInst*>&,
 			const SmallVectorImpl<CallInst*>&);
-	size_t estimateShortestPath(Instruction*, const Instruction*);
+	size_t estimateShortestPath(const SmallVectorImpl<CallInst*>&,
+			const SmallVectorImpl<CallInst*>&);
 	// implementation for the above fns
-	size_t estimatePathLat(BasicBlock*, const Instruction*, const size_t, const bool,
-			const bool);
+	std::pair<size_t, bool> estimatePathLat(Instruction*, const Instruction*,
+			const size_t, const bool, const bool, const bool);
 };
 
 PrimeBortDetectorPass* createPrimeBortDetectorPass();
