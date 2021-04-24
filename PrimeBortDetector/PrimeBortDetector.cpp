@@ -37,7 +37,7 @@ PreservedAnalyses PrimeBortDetectorPass::run(Module &M, ModuleAnalysisManager &A
 
 
 bool PrimeBortDetectorPass::runOnModule(Module &M) {
-	LLVM_DEBUG(dbgs() << "Start Prime+Abort detector pass";);
+	LLVM_DEBUG(dbgs() << "Start Prime+Abort detector pass\n";);
 
 	Function* txBegin = M.getFunction("llvm.x86.xbegin");
 	Function* txCommit = M.getFunction("llvm.x86.xend");
@@ -270,7 +270,7 @@ size_t PrimeBortDetectorPass::estimatePathFromChains(
 	// get latency in each function in start chain
 	for (unsigned i = startChain.size()-1; i > 0; --i) {
 		auto retp = estimatePathLat(startChain[i]->getParent()->getFirstNonPHIOrDbg(),
-				NULL, lat, true, true, false);
+				NULL, lat, newCacheTag(), longest, true, false);
 		assert(!retp.second);
 		lat += retp.first;
 	}
@@ -285,7 +285,7 @@ size_t PrimeBortDetectorPass::estimatePathFromChains(
 	for (unsigned i = 1; i < destChain.size(); ++i) {
 		retp = estimatePathLat(
 				destChain[i-1]->getCalledFunction()->getEntryBlock().getFirstNonPHIOrDbg(),
-				destChain[i], lat, true, true, false);
+				destChain[i], lat, newCacheTag(), longest, true, false);
 		lat += retp.first;
 	}
 	assert(retp.second);
@@ -314,7 +314,7 @@ size_t PrimeBortDetectorPass::estimateLatThroughCallers (
 	assert(start->getFunction() == dest->getFunction());
 	Function* F = start->getFunction();
 
-	auto retp = estimatePathLat(start, dest, prev_lat, longest, true, true);
+	auto retp = estimatePathLat(start, dest, prev_lat, newCacheTag(), longest, true, true);
 	// return if dest is reachable at this level
 	if (retp.second) return retp.first;
 
@@ -341,72 +341,82 @@ size_t PrimeBortDetectorPass::estimateLatThroughCallers (
 // non-canonical loops are pretty suspicious in a tx
 #define FALLBACK_ITER_COUNT 128
 size_t PrimeBortDetectorPass::estimateTotalLoopLat (const Loop* L,
-		BasicBlock*& entry, const bool longest) {	
+		BasicBlock*& entry, const unsigned topLevelTag, const bool longest) {	
 	// get exit BBs and loop analysis results
 	SmallVector<BasicBlock*, 4> exits;
-	L->getExitBlocks(exits);
+	L->getExitingBlocks(exits);
 	ScalarEvolution& SE = 
 		getAnalysis<ScalarEvolutionWrapperPass>(*(entry->getParent())).getSE();
 
-	// find the highest/lowest total latency considering iterations and path length
-	if (SE.isBackedgeTakenCountMaxOrZero(L)) { // no good iteration estimate
-		size_t sel_lat = (longest) ? 0 : SIZE_MAX;
-		BasicBlock* sel_bb = NULL;
-		for (auto BB = exits.begin(); BB != exits.end(); ++BB) {
-			auto retp = estimatePathLat(entry->getFirstNonPHIOrDbg(),
-					(*BB)->getTerminator(), 0, longest, false, true);
-			if ((longest && retp.first > sel_lat)
-					|| (!longest && retp.first < sel_lat)) {
-				sel_lat = retp.first;
-				sel_bb = *BB;
-			}
+	size_t ret = (longest) ? 0 : SIZE_MAX;
+	unsigned fallback_iter = SE.getSmallConstantMaxTripCount(L);
+	if (fallback_iter == 0) fallback_iter = FALLBACK_ITER_COUNT;
+	BasicBlock* sel_bb = NULL;
+	for (auto BB = exits.begin(); BB != exits.end(); ++BB) {
+		unsigned iter = SE.getSmallConstantTripCount(L, *BB);
+		if (iter == 0) iter = fallback_iter;
+		auto retp = estimatePathLat(entry->getFirstNonPHIOrDbg(),
+				 (*BB)->getTerminator(), 0, topLevelTag, longest, false, true);
+		size_t tlat = retp.first * iter;
+		if ((longest && tlat > ret)
+				|| (!longest && tlat < ret)) {
+			ret = tlat;
+			sel_bb = *BB;
 		}
-
-		// return the selected exit to the caller
-		assert(sel_bb);
-		entry = sel_bb;
-
-		if (SE.getSmallConstantMaxTripCount(L) != 0)
-			return sel_lat*SE.getSmallConstantMaxTripCount(L);
-		else 
-			return sel_lat*FALLBACK_ITER_COUNT;
-
-	} else { // iteration estimates exist, use them
-		size_t ret = (longest) ? 0 : SIZE_MAX;
-		BasicBlock* sel_bb = NULL;
-		for (auto BB = exits.begin(); BB != exits.end(); ++BB) {
-			unsigned iter = SE.getSmallConstantTripCount(L, *BB);
-			auto retp = estimatePathLat(entry->getFirstNonPHIOrDbg(),
-					 (*BB)->getTerminator(), 0, longest, false, true);
-			size_t tlat = retp.first * iter;
-			if ((longest && tlat > ret)
-					|| (!longest && tlat < ret)) {
-				ret = tlat;
-				sel_bb = *BB;
-			}
-		}
-		// return the selected exit to the caller
-		assert(sel_bb);
-		entry = sel_bb;
-		return ret;
 	}
+	// return the selected exit to the caller
+	assert(sel_bb);
+	entry = sel_bb;
+	return ret;	
 }
 
 // TODO: does not properly explore exit paths from loops in some cases
 // not a huge issue since loops with multiple exits are unusual
 std::pair<size_t, bool>
 PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* dest,
-		const size_t prev_lat, const bool longest, const bool handleLoops,
+		const size_t prev_lat, const unsigned topLevelTag,
+		const bool longest, const bool handleLoops,
 		const bool preferHits) {
 
-	if (prev_lat >= MAX_SEARCH_DIST) return std::make_pair(prev_lat, false);
-
-	BasicBlock* BB = start->getParent();
-	LatencyVisitor LV;
-	LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>(*(BB->getParent())).getLoopInfo();
-	Loop* L = LI.getLoopFor(BB);
+	if (prev_lat >= MAX_SEARCH_DIST) return std::make_pair(0, false);
 
 	size_t here_lat = 0;
+	BasicBlock* BB = start->getParent();
+	BasicBlock* entry_BB = BB; // loop coalescing might change BB
+	// we pseudo-coalesce loops into a single block by finding the longest
+	// path through them and jumping to the corresponding exit
+	// unless the destination is in the same loop
+	if (handleLoops) {
+		LoopInfo& LI = getAnalysis<LoopInfoWrapperPass>(*(BB->getParent())).getLoopInfo();
+		Loop* L = LI.getLoopFor(BB);
+		Loop* dL = (dest) ? LI.getLoopFor(dest->getParent()) : NULL; 
+		if (L && L != dL) {
+			here_lat = estimateTotalLoopLat(L, BB, topLevelTag, longest);
+		}
+	}
+
+	// the tag is either the destination or the function containing the
+	// start BB if dest is null
+	//
+	// if the tag matches, the cached value is returned
+	//
+	// this handles reconvergent paths, and protects loops from endless
+	// recursion when using estimateTotalLoopLat
+	auto f_it = BBLatCache.find(BB);
+	if (f_it != BBLatCache.end()) {
+		BBLatEntry& nt = f_it->second;
+		if (nt.tag == topLevelTag) {
+			return nt.prev;
+		} else {
+			f_it->second = {topLevelTag, std::make_pair(0, false)};
+		}
+	} else {
+		auto emplit = BBLatCache.try_emplace(BB, topLevelTag, std::make_pair(0, false));
+		assert(emplit.second);
+	}
+
+	// get latency for the current block
+	LatencyVisitor LV;
 	bool hitDest = false;
 	if (dest && dest->getParent() == BB) { // we have reached our destination, probably
 		for (Instruction* I = start; I && I != BB->getTerminator();
@@ -417,14 +427,10 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 				break;
 			}
 		}
-	} else if (handleLoops && L) { // this BB is a loop entry, handle the loop as a chunk
-		// this updates BB to be the exit node for the chosen path
-		here_lat = estimateTotalLoopLat(L, BB, longest);
 	} else {
 		LV.visit(BB);
 	}
-
-	here_lat = LV.getLat();
+	here_lat += LV.getLat();
 
 	// add latency for functions called in this BB
 	while (LV.hasCall()) {
@@ -433,12 +439,18 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 		if (F && !(F->empty())) { // ignore intrinsics
 			// TODO: ignores indirect calls
 			auto retp = estimatePathLat(F->getEntryBlock().getFirstNonPHIOrDbg(),
-					NULL, prev_lat + here_lat, longest, true, false);
+					NULL, prev_lat + here_lat, topLevelTag, longest, handleLoops, false);
 			here_lat += retp.first;
 		}
 	}
 
-	if (hitDest) return std::make_pair(here_lat, true);
+	if (hitDest) {
+		auto ret = std::make_pair(here_lat, true);
+		auto f_it = BBLatCache.find(entry_BB);
+		assert(f_it != BBLatCache.end());
+		f_it->second = {topLevelTag, ret};
+		return ret;
+	}
 
 	// recurse on each successor, and select the longest/shortest path,
 	// optionally preferring hits 
@@ -447,7 +459,7 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 		const Instruction* T = BB->getTerminator(); 
 		for (unsigned i = 0; i < T->getNumSuccessors(); ++i) {
 			auto retp = estimatePathLat(T->getSuccessor(i)->getFirstNonPHIOrDbg(),
-					dest, prev_lat + here_lat, longest, true, preferHits);
+					dest, prev_lat + here_lat, topLevelTag, longest, handleLoops, preferHits);
 			// split up the conditional for readability
 			// this is the base condition: whether this is the longest/shortest path seen
 			bool selPath =
@@ -464,7 +476,11 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 		}
 	} else more_lat = 0; // don't add SIZE_MAX when returning from a function
 
-	return std::make_pair(here_lat + more_lat, hitDest);	
+	auto ret = std::make_pair(here_lat + more_lat, hitDest);
+	f_it = BBLatCache.find(entry_BB);
+	assert(f_it != BBLatCache.end());
+	f_it->second = {topLevelTag, ret};
+	return ret;	
 }
 			
 } // namespace llvm

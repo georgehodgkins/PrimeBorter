@@ -9,6 +9,18 @@
 void beginTx() {assert(_xbegin() == UINT_MAX);}
 void commitTx() {_xend();}
 
+int txCounter = 0;
+
+void beginTxAndCount () {
+	beginTx();
+	++txCounter;
+}
+
+void commitTxAndUncount () {
+	commitTx();
+	--txCounter;
+}
+
 struct ll_node_s {
 	void* pt; // pointer to stored element
 	struct ll_node_s *next; // pointer to next element in chain
@@ -91,8 +103,12 @@ int llfifo_enqueue(llfifo_t* fifo, void* element) {
 }
 
 void* llfifo_dequeue(llfifo_t* fifo) {
+	beginTxAndCount();
 
-	if (fifo->head == NULL || fifo->head->pt == NULL) return NULL;
+	if (fifo->head == NULL || fifo->head->pt == NULL) {
+		commitTxAndUncount();
+		return NULL;
+	}
 	
 	ll_node_t* node = fifo->head;
 	if (node == fifo->tail) { // last element being removed, leave head where it is
@@ -119,6 +135,7 @@ void* llfifo_dequeue(llfifo_t* fifo) {
 	assert(fifo->length > 0);
 	--fifo->length;
 
+	commitTxAndUncount();
 	return element;
 }
 
@@ -180,6 +197,7 @@ void test_llfifo () {
 	assert(llfifo_length(the_llfifo) == 0);
 
 	// fill fifo up to its initial cap
+	beginTx();
 	int len;	
 	for (len = 0; len < TEST_SIZE/2; ++len) {
 		assert(llfifo_length(the_llfifo) == len);
@@ -187,6 +205,7 @@ void test_llfifo () {
 
 		llfifo_enqueue(the_llfifo, &test_set[len]);
 	}
+	commitTx();
 
 	// add some more elements to make it resize
 	for (; len < 3*TEST_SIZE/4; ++len) {
@@ -204,12 +223,14 @@ void test_llfifo () {
 
 	// dequeue the first half
 	for (size_t dq = 0; dq < TEST_SIZE/2; ++dq) {
+		beginTxAndCount();
 		int* test = (int*) llfifo_dequeue(the_llfifo);
 		assert(test != NULL);
 		assert(*test == test_set[dq]);
 		--len;
 		assert(llfifo_length(the_llfifo) == len);
 		assert(llfifo_capacity(the_llfifo) == peak_cap);
+		commitTxAndUncount();
 	}
 
 	// alternate dequeues and enqueues

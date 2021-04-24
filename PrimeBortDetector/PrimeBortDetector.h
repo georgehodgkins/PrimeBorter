@@ -8,6 +8,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include <list>
+#include <unordered_map>
 #include <utility>
 
 #define MAX_SEARCH_DIST 1500000 // 1 ms at 1.5 GHz
@@ -44,7 +45,20 @@ class PrimeBortDetectorPass : public ModulePass {
 	};
 
 	private:
-	DenseMap<BasicBlock*, size_t> BBLatCache;
+	struct BBLatEntry {
+		unsigned tag;
+		std::pair<size_t, bool> prev;
+
+		BBLatEntry(const unsigned t, const std::pair<size_t, bool> p) 
+			: tag(t), prev(p) {}
+	};
+	DenseMap<BasicBlock*, BBLatEntry> BBLatCache;
+	unsigned tagCounter;
+	unsigned newCacheTag () {
+		unsigned r = ++tagCounter;
+		if (r == 0) BBLatCache.clear();
+		return r;
+	}
 
 	CI_list txCommitCallers;
 	DenseMap<CallInst*, CallInst*> txCommitCallees;
@@ -63,7 +77,7 @@ class PrimeBortDetectorPass : public ModulePass {
 	// match tx entry points with reachable exit points in the same function
 	void boundTxInFunc(BasicBlock*, const SmallVectorImpl<CallInst*>&, TxInfo&);
 	// estimates total latency for a loop
-	size_t estimateTotalLoopLat(const Loop*, BasicBlock*&, const bool);
+	size_t estimateTotalLoopLat(const Loop*, BasicBlock*&, const unsigned, const bool);
 	// estimator that can climb up the call graph
 	size_t estimateLatThroughCallers(Instruction*, const CallInst*,
 			const size_t, const bool);
@@ -78,7 +92,7 @@ class PrimeBortDetectorPass : public ModulePass {
 			const SmallVectorImpl<CallInst*>&);
 	// implementation for the above fns
 	std::pair<size_t, bool> estimatePathLat(Instruction*, const Instruction*,
-			const size_t, const bool, const bool, const bool);
+			const size_t, const unsigned, const bool, const bool, const bool);
 };
 
 PrimeBortDetectorPass* createPrimeBortDetectorPass();

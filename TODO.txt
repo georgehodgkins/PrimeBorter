@@ -1,8 +1,6 @@
 LLVM pass:
 	- Remnant cleanup
-	- Loop exits
 	- Multiple roots
-	- Path length caching
 	- Live-in analysis
 
 Evaluation framework:
