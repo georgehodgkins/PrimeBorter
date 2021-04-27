@@ -37,13 +37,20 @@ struct llfifo_s {
 typedef struct llfifo_s llfifo_t;
 
 llfifo_t* llfifo_create (int capacity) { 
-	if (capacity < 0) return NULL;
+	beginTx();
+	if (capacity < 0) {
+		commitTxAndUncount();
+		return NULL;
+	}
 
 	// allocate everything we need (fifo struct + reqd node count) in one chunk
 	assert(sizeof(llfifo_t) == 2*sizeof(ll_node_t)
 			&& "You messed with the alignment! Everything is broken now");
 	uint64_t* inalloc = calloc(capacity + 2, sizeof(ll_node_t));
-	if (inalloc == NULL) return NULL;
+	if (inalloc == NULL) {
+		commitTxAndUncount();
+		return NULL;
+	}
 	// first 32 bytes are fifo struct
 	llfifo_t* this = (llfifo_t*) inalloc;
 
@@ -62,6 +69,7 @@ llfifo_t* llfifo_create (int capacity) {
 		this->free_tail = &nodes[capacity-1];
 	}
 
+	commitTxAndUncount();
 	return this;
 }
 

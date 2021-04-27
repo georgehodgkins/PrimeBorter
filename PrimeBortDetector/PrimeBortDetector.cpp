@@ -19,7 +19,6 @@ char PrimeBortDetectorPass::ID = 0;
 PrimeBortDetectorPass *createPrimeBortDetectorPass() {return new PrimeBortDetectorPass;}
 
 using CI_list = PrimeBortDetectorPass::CI_list;
-using CandidateMap = PrimeBortDetectorPass::CandidateMap;
 using TxInfo = PrimeBortDetectorPass::TxInfo;
 
 PrimeBortDetectorPass::PrimeBortDetectorPass() : ModulePass(ID) {}
@@ -37,13 +36,15 @@ PreservedAnalyses PrimeBortDetectorPass::run(Module &M, ModuleAnalysisManager &A
 
 
 bool PrimeBortDetectorPass::runOnModule(Module &M) {
-	LLVM_DEBUG(dbgs() << "Start Prime+Abort detector pass\n";);
+	LLVM_DEBUG(dbgs() << "Start Prime+Abort detector pass\n");
 
-	Function* txBegin = M.getFunction("llvm.x86.xbegin");
-	Function* txCommit = M.getFunction("llvm.x86.xend");
+	// get leaf callable objects
+	SmallVector<Function*, 4> txBegin; 
+	SmallVector<Function*, 4> txCommit;
+	populateLeafSets(M, txBegin, txCommit);
 
-	if (txBegin) {
-		assert(txCommit);
+	if (!txBegin.empty()) {
+		assert(!txCommit.empty());
 
 		/*
 		 * For each call to txBegin, find an ancestor function
@@ -51,8 +52,9 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 		 * of txCommit
 		 */
 
-		// check graph one level at a time
-		CI_list prev_blevel, prev_clevel, new_blevel, new_clevel;
+		// check graph one level at a time until all call sites are matched or we hit the
+		// top of the graph
+		CI_list prev_blevel, prev_clevel, new_blevel, new_clevel, rem_blevel, rem_clevel;
 		do {
 			// get next graph level
 			new_blevel = levelUpCallerGraph(txBegin, prev_blevel,
@@ -60,38 +62,114 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 			new_clevel = levelUpCallerGraph(txCommit, prev_clevel,
 								txCommitCallees);
 
-			// find tx entries and exits in the same function
-			auto candidates = findCandidates(new_blevel, new_clevel);
+			// find tx entries and exits in the same function and add them to foundTx
+			// return matched CallInst that were removed from the lists
+			auto prunes = findCandidates(new_blevel, new_clevel);
 
-			// match entries to exits
-			for (auto it = candidates.begin(); it != candidates.end(); ++it) {
-				auto F = it->second;
-				const SmallVectorImpl<CallInst*>& entries = F.first;
-				const SmallVectorImpl<CallInst*>& exits = F.second;
-				// each entry is its own transaction, with one or more exits
-				for (CallInst* entry : entries) {
-					TxInfo info;
-					info.entry = entry;
-					info.ancestor = it->first;
-					// find any of these exits that are reachable and record them in info
-					boundTxInFunc(entry->getParent(), exits, info);
-					assert(!info.exits.empty() && 
-							"PrimeBort: No reachable tx exits found!");
-					foundTx[entry] = info;
+			// remove remnants that were matched at this level
+			pruneRemnant(prunes.first, rem_blevel, txBeginCallees);
+			pruneRemnant(prunes.second, rem_clevel, txCommitCallees);
+
+			// old levels go to remnant sets
+			rem_blevel.splice(rem_blevel.end(), prev_blevel);
+			rem_clevel.splice(rem_clevel.end(), prev_clevel);
+
+			// un-matched portion of new levels become old levels
+			prev_blevel = new_blevel;
+			prev_clevel = new_clevel; 
+
+		} while (!(prev_blevel.empty() || prev_clevel.empty()));
+		
+		// repeat process to match remnants
+		if (!prev_blevel.empty()) rem_blevel.splice(rem_blevel.end(), prev_blevel);
+		if (!prev_clevel.empty()) rem_clevel.splice(rem_clevel.end(), prev_clevel);
+		if (!rem_blevel.empty() || !prev_clevel.empty()) {
+			
+			auto prunes = findCandidates(rem_blevel, rem_clevel);
+			pruneRemnant(prunes.first, rem_blevel, txBeginCallees);
+			pruneRemnant(prunes.second, rem_clevel, txCommitCallees);
+
+			while (!rem_blevel.empty()) {
+				const CI_list::iterator orig_end = rem_blevel.end();
+				for (auto it = rem_blevel.begin(); it != orig_end; ++it) {
+					// TODO: this is inefficient here
+					CallInst* CI = *it;
+					auto f_it = candidateMap.find(CI->getFunction());
+					if (f_it != candidateMap.end()) {
+						f_it->second.first.push_back(CI);
+						continue;
+					}
+					for (auto U = CI->user_begin(); U != CI->user_end(); ++U) {
+						if (isa<CallInst>(*U)) {
+							CallInst* T = cast<CallInst>(*U);
+							auto f_it = candidateMap.find(T->getFunction());
+							if (f_it != candidateMap.end()) {
+								f_it->second.first.push_back(T);
+							} else {
+								rem_blevel.push_back(T);
+							}
+						}
+					}
+				}
+				rem_blevel.erase(rem_blevel.begin(), orig_end);
+			}
+			while (!rem_clevel.empty()) {
+				const CI_list::iterator orig_end = rem_clevel.end();
+				for (auto it = rem_clevel.begin(); it != orig_end; ++it) {
+					// TODO: this is inefficient here
+					CallInst* CI = *it;
+					auto f_it = candidateMap.find(CI->getFunction());
+					if (f_it != candidateMap.end()) {
+						f_it->second.second.push_back(CI);
+						continue;
+					}
+					for (auto U = CI->use_begin(); U != CI->use_end(); ++U) {
+						if (isa<CallInst>(*U)) {
+							CallInst* T = cast<CallInst>(*U);
+							auto f_it = candidateMap.find(T->getFunction());
+							if (f_it != candidateMap.end()) {
+								f_it->second.second.push_back(T);
+							} else {
+								rem_clevel.push_back(T);
+							}
+						}
+					}
+				}
+				rem_clevel.erase(rem_clevel.begin(), orig_end);
+			}
+		}
+
+LLVM_DEBUG(
+		for (CallInst* CI : rem_blevel) 
+			dbgs() << "Unmatched " << *CI << " @ " << *(CI->getFunction()) << '\n';
+		for (CallInst* CI : rem_clevel) 
+			dbgs() << "Unmatched " << *CI << " @ " << *(CI->getFunction()) << '\n';
+);
+		
+		// match entries to exits
+		for (auto it = candidateMap.begin(); it != candidateMap.end(); ++it) {
+			auto F = it->second;
+			const SmallVectorImpl<CallInst*>& entries = F.first;
+			const SmallVectorImpl<CallInst*>& exits = F.second;
+			// each entry is its own transaction, with one or more exits
+			for (CallInst* entry : entries) {
+				TxInfo info;
+				info.entry = entry;
+				info.ancestor = it->first;
+				// find any of these exits that are reachable and record them in info
+				boundTxInFunc(entry->getParent(), exits, info);
+				if (info.exits.empty()) {
+					LLVM_DEBUG(dbgs() << "Entry point " << *entry << " in function " << 
+						entry->getFunction()->getName() << "has no reachable exits!";);
+				} else {
+					foundTx.push_back(info);
 				}
 			}
+		}
 
-			// remainder is non-common ancestors
-			prev_blevel = new_blevel;
-			prev_clevel = new_clevel;
-		// end when no non-common ancestors were found on this iteration
-		} while (!prev_blevel.empty() && !prev_clevel.empty());
-
-		assert(prev_blevel.empty() && prev_clevel.empty());
-	
 		// get call chains to entry and exit for each found tx
 		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
-			TxInfo& info = it->second;
+			TxInfo& info = *it;
 			CallInst* CI = info.entry;
 			do {
 				info.entryChain.push_back(CI);
@@ -109,12 +187,12 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 		}
 
 		/*
-		 * For each paired tx, estimate the longest path through the tx and
-		 * the shortest path back to the beginning from the exit.
+		 * For each tx entry found, estimate the longest path through the tx and
+		 * the shortest path back to the beginning for all reachable exits.
 		 */
 
 		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
-			TxInfo& info = it->second;
+			TxInfo& info = *it;
 			for (unsigned i = 0; i < info.exits.size(); ++i) {
 				size_t txLat = estimateLongestPath(info.entryChain, info.exitChains[i]);
 				size_t rtLat = estimateShortestPath(info.exitChains[i], info.entryChain);
@@ -127,7 +205,7 @@ bool PrimeBortDetectorPass::runOnModule(Module &M) {
 LLVM_DEBUG(
 		dbgs() << "FOUND " << foundTx.size() << " TRANSACTIONS:\n=====\n";
 		for (auto it = foundTx.begin(); it != foundTx.end(); ++it) {
-			TxInfo& info = it->second;
+			TxInfo& info = *it;
 			dbgs() << "Common Func: " << info.ancestor->getName() <<
 				"\nEntry point: " << *info.entry << " -->" << *(info.entryChain.back()) <<
 				"\nExit\t\t\t\t\t\ttxLat\trtLat\n";
@@ -146,80 +224,148 @@ LLVM_DEBUG(
 	return false;
 }
 
+#define PUSH_IF_EXISTS(vec, val) \
+	do { \
+		auto v = val; \
+		if (v != NULL) vec.push_back(v); \
+	} while (false)
+
+void PrimeBortDetectorPass::populateLeafSets(const Module& M,
+		SmallVector<Function*, 4>& begin, SmallVector<Function*, 4>& commit) {
+
+	PUSH_IF_EXISTS(begin, M.getFunction("llvm.x86.xbegin"));
+	PUSH_IF_EXISTS(commit, M.getFunction("llvm.x86.xend"));
+
+	PUSH_IF_EXISTS(begin, M.getFunction("pthread_mutex_lock"));
+	PUSH_IF_EXISTS(begin, M.getFunction("pthread_rwlock_rdlock"));
+	PUSH_IF_EXISTS(begin, M.getFunction("pthread_rwlock_wrlock"));
+	PUSH_IF_EXISTS(commit, M.getFunction("pthread_mutex_unlock"));
+	PUSH_IF_EXISTS(commit, M.getFunction("pthread_rwlock_unlock"));
+}
+
+void PrimeBortDetectorPass::pruneRemnant(CI_list& prune, CI_list& rem,
+		const DenseMap<CallInst*, CallInst*>& links) {
+	if (rem.empty()) return;
+	// find chains for each element of original prune list
+	// add chains to prune list
+	const size_t osz = prune.size();
+	auto it = prune.begin();
+	for (size_t i = 0; i < osz; ++i) {
+		const auto f_it = links.find(*(it++));
+		assert(f_it != links.end());
+		CallInst* CI = f_it->second; 
+		while (CI) {
+			prune.push_back(CI);
+			const auto f_it = links.find(CI);
+			assert(f_it != links.end());
+			CI = f_it->second;
+		}
+	}
+
+	// sort by called function 
+	prune.sort();
+	rem.sort();
+
+	auto P_it = prune.begin();
+	auto R_it = rem.begin();
+	while (P_it != prune.end() && R_it != rem.end()) {
+		if (*P_it < *R_it) ++P_it;
+		else if (*R_it < *P_it) ++R_it;
+		else {
+			// remove all instances of this call from both lists
+			const CallInst* CI = *P_it;
+			do {
+				auto old = R_it++;
+				rem.erase(old);
+			} while (*R_it == CI);
+			do {
+				auto old = P_it++;
+				prune.erase(old);
+			} while (*P_it == CI);
+		}
+	}
+}
+
 bool PrimeBortDetectorPass::compCallInstByFunction(const CallInst* A, const CallInst* B) {
 	return A->getFunction() < B->getFunction();
 }
 
-
-CandidateMap PrimeBortDetectorPass::findCandidates(CI_list& A, CI_list& B) {
-	auto A_it = A.begin();
-	auto B_it = B.begin();
-	CandidateMap intersect;
+std::pair<CI_list, CI_list>
+PrimeBortDetectorPass::findCandidates(CI_list& A, CI_list& B) {	
 	// values to be removed at the end
 	SmallVector<CI_list::iterator, 8> rmA;
 	SmallVector<CI_list::iterator, 8> rmB;
 
+	// diff requires sort first
+	A.sort(compCallInstByFunction);
+	B.sort(compCallInstByFunction);
+
+	// find the intersection of the lists 
+	auto A_it = A.begin();
+	auto B_it = B.begin();
 	while (A_it != A.end() && B_it != B.end()) {
-		if (compCallInstByFunction(*A_it, *B_it)) { // A < B
+		if (compCallInstByFunction(*A_it, *B_it)) {
 			++A_it;
-		} else if (compCallInstByFunction(*B_it, *A_it)) { // B < A
+		} else if (compCallInstByFunction(*B_it, *A_it)) {
 			++B_it;
 		} else { // equal
 			// there may be multiple in either A or B that match the function,
 			// we want all of them
 			Function* F = (*A_it)->getFunction();
-			intersect[F].first.push_back(*A_it);
+			candidateMap[F].first.push_back(*A_it);
 			rmA.push_back(A_it);
 			while ( ++A_it != A.end() && (*A_it)->getFunction() == F) {
-				intersect[F].first.push_back(*A_it);
+				candidateMap[F].first.push_back(*A_it);
 				rmA.push_back(A_it);
 			}
 
-			intersect[F].second.push_back(*B_it);
+			candidateMap[F].second.push_back(*B_it);
 			rmB.push_back(B_it);
 			while (++B_it != B.end() && (*B_it)->getFunction() == F) {
-				intersect[F].second.push_back(*B_it);
+				candidateMap[F].second.push_back(*B_it);
 				rmB.push_back(B_it);
 			}
 		}
 	}
 
-	// remove intersection from sets
-	while (!rmA.empty()) {A.erase(rmA.pop_back_val());}
-	while (!rmB.empty()) {B.erase(rmB.pop_back_val());}
-
-	return intersect;
+	// remove intersection from sets and return it for remnant pruning
+	// lists to return removed values
+	CI_list A_tomb, B_tomb;
+	while (!rmA.empty()) {A_tomb.splice(A_tomb.end(), A, rmA.pop_back_val());}
+	while (!rmB.empty()) {B_tomb.splice(B_tomb.end(), B, rmB.pop_back_val());}
+	return std::make_pair(A_tomb, B_tomb);
 }
 
-CI_list PrimeBortDetectorPass::levelUpCallerGraph(Function* root, CI_list& prev_level,
+CI_list PrimeBortDetectorPass::levelUpCallerGraph(SmallVectorImpl<Function*>& root, CI_list& prev_level,
 		DenseMap<CallInst*, CallInst*>& links) {
 
 	CI_list new_level;
-	if (prev_level.empty()) {
-		assert(links.empty());
-		for (auto U = root->user_begin(); U != root->user_end(); ++U) {
-			if (isa<CallInst>(*U)) {
-				CallInst* CI = cast<CallInst>(*U);
-				new_level.push_back(CI);
-				auto emplit = links.try_emplace(CI, nullptr);
-				assert(emplit.second);
+	if (links.empty()) { // get next level from root sets
+		assert(prev_level.empty());
+		for (unsigned i = 0; i < root.size(); ++i) {
+			for (auto U = root[i]->user_begin(); U != root[i]->user_end(); ++U) {
+				if (isa<CallInst>(*U)) {
+					CallInst* CI = cast<CallInst>(*U);
+					new_level.push_back(CI);
+					auto emplit = links.try_emplace(CI, nullptr);
+					assert(emplit.second || emplit.first->second == nullptr);
+				}
 			}
 		}
-	} else {
+	} else { // get next level from previous level
 		for (auto I = prev_level.begin(); I != prev_level.end(); ++I) {
 			Function* F = (*I)->getFunction();
 			for (auto U = F->user_begin(); U != F->user_end(); ++U) {
 				if (isa<CallInst>(*U)) {
 					CallInst* CI = cast<CallInst>(*U);
 					auto emplit = links.try_emplace(CI, *I);
-					assert(emplit.second);
+					assert(emplit.second || emplit.first->second == *I);
 					new_level.push_back(CI);
 				}
 			}	
 		}
 	}
 	
-	new_level.sort(compCallInstByFunction);
 	return new_level;
 }
 
@@ -383,7 +529,7 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 	size_t here_lat = 0;
 	BasicBlock* BB = start->getParent();
 	BasicBlock* entry_BB = BB; // loop coalescing might change BB
-	// we pseudo-coalesce loops into a single block by finding the longest
+	// pseudo-coalesce loops into a single block by finding the longest
 	// path through them and jumping to the corresponding exit
 	// unless the destination is in the same loop
 	if (handleLoops) {
@@ -395,12 +541,10 @@ PrimeBortDetectorPass::estimatePathLat (Instruction* start, const Instruction* d
 		}
 	}
 
-	// the tag is either the destination or the function containing the
-	// start BB if dest is null
+	// if the tag matches, the cached value is returned; if not,
+	// an empty value is placed in the map and filled out when we return
 	//
-	// if the tag matches, the cached value is returned
-	//
-	// this handles reconvergent paths, and protects loops from endless
+	// this handles reconvergent paths, and stops endless
 	// recursion when using estimateTotalLoopLat
 	auto f_it = BBLatCache.find(BB);
 	if (f_it != BBLatCache.end()) {

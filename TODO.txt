@@ -1,6 +1,4 @@
 LLVM pass:
-	- Remnant cleanup
-	- Multiple roots
 	- Live-in analysis
 
 Evaluation framework:

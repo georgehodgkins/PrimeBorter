@@ -19,8 +19,6 @@ class PrimeBortDetectorPass : public ModulePass {
 
 	public:
 	typedef std::list<CallInst*> CI_list;
-	typedef DenseMap<Function*,
-			std::pair<SmallVector<CallInst*, 4>, SmallVector<CallInst*, 4> > > CandidateMap;
 	bool runOnModule (Module &M);
 	PreservedAnalyses run (Module &M, ModuleAnalysisManager &AM);
 	PrimeBortDetectorPass();
@@ -66,14 +64,21 @@ class PrimeBortDetectorPass : public ModulePass {
 	CI_list txBeginCallers;
 	DenseMap<CallInst*, CallInst*> txBeginCallees;
 
-	DenseMap<CallInst*, TxInfo> foundTx;
+	DenseMap<Function*,
+		std::pair<SmallVector<CallInst*, 4>, SmallVector<CallInst*, 4> > > candidateMap;
+	SmallVector<TxInfo, 0> foundTx;
 
 	// comparator to order CallInsts by their parent function
 	static bool compCallInstByFunction(const CallInst*, const CallInst*);
 	// returns the intersection of two graphs, removing those elements from the operands
-	CandidateMap findCandidates (CI_list&, CI_list&);
+	std::pair<CI_list, CI_list> findCandidates (CI_list&, CI_list&);
+	void populateLeafSets(const Module&, 
+			SmallVector<Function*,4>&, SmallVector<Function*,4>&);
+	// removes any elements in the remnant set that are in call chains of the prune set
+	void pruneRemnant(CI_list&, CI_list&, const DenseMap<CallInst*, CallInst*>&);
 	// computes and returns the next level of a caller graph
-	CI_list levelUpCallerGraph(Function*, CI_list&, DenseMap<CallInst*, CallInst*>&);
+	CI_list levelUpCallerGraph(SmallVectorImpl<Function*>&,
+			CI_list&, DenseMap<CallInst*, CallInst*>&);
 	// match tx entry points with reachable exit points in the same function
 	void boundTxInFunc(BasicBlock*, const SmallVectorImpl<CallInst*>&, TxInfo&);
 	// estimates total latency for a loop
